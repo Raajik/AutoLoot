@@ -1,0 +1,32 @@
+# ── Build output ────────────────────────────────────────────────────────────
+# These folders are generated automatically every time you build.
+# There's no reason to store them in Git — anyone who clones the repo
+# can regenerate them by building the project themselves.
+bin/
+obj/
+
+# ── Visual Studio / Rider ────────────────────────────────────────────────────
+# IDE-specific files that are personal to your machine and shouldn't be shared.
+.vs/
+*.user
+*.suo
+*.rsuser
+.idea/
+
+# ── NuGet packages ───────────────────────────────────────────────────────────
+# NuGet restores packages automatically on build, so no need to commit them.
+packages/
+*.nupkg
+
+# ── OS junk ──────────────────────────────────────────────────────────────────
+# Files your operating system creates automatically that have nothing to do
+# with the project.
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# ── Secrets / local config ───────────────────────────────────────────────────
+# Never commit files that might contain passwords, API keys, or local paths
+# that are specific to your machine.
+*.env
+secrets.json
