@@ -46,7 +46,7 @@ internal class Commands
         profile.Initialize();
 
         // Evaluate the item — "match" will be set to the first Rule that the item satisfies
-        Rule match = null;
+        Rule? match = null;
         var action = Profile.SampleProfile.Evaluate(item, ref match);
 
         if (action == Loot.Action.None)
@@ -83,7 +83,7 @@ internal class Commands
         sb.Append($"\nGenerated {numProfiles} in {time}ms");
         watch.Restart();
 
-        Rule match = null;
+        Rule? match = null;
         var action = profile.Evaluate(item, ref match);
         time = watch.ElapsedMilliseconds;
         sb.Append($"\nEvaluated in {time}ms");
@@ -123,7 +123,7 @@ internal class Commands
         sb.Append($"\nGenerated {numProfiles} in {time}ms");
         watch.Restart();
 
-        Rule match = null;
+        Rule? match = null;
         var action = profile.Evaluate(item, ref match);
         time = watch.ElapsedMilliseconds;
         sb.Append($"\nEvaluated in {time}ms");
@@ -163,7 +163,7 @@ internal class Commands
         sb.Append($"\nGenerated {numProfiles} in {time}ms");
         watch.Restart();
 
-        Rule match = null;
+        Rule? match = null;
         var action = profile.Evaluate(item, ref match);
         time = watch.ElapsedMilliseconds;
         sb.Append($"\nEvaluated in {time}ms");

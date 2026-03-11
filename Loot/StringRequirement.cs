@@ -28,7 +28,7 @@ public class StringRequirement
     // The compiled regex, populated by Initialize(). Kept private because the Regex
     // object is created from the public Value string and shouldn't be set externally.
     // Todo: consider making this readonly (requires refactoring to a constructor-based approach)
-    Regex _regex { get; set; }
+    Regex? _regex { get; set; }
 
     /// <summary>
     /// Which string property on the item to match against.

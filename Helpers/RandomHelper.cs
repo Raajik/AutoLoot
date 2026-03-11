@@ -137,7 +137,7 @@ public static class RandomHelper
     ///
     /// Each line in the file is treated as one word.
     /// </summary>
-    static string[] _words;
+    static string[]? _words;
     static string[] randomWords
     {
         get

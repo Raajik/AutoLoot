@@ -1,7 +1,10 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 	<PropertyGroup>
 		<TargetFramework>net8.0</TargetFramework>
-		<NoWarn>0436;1073;8509</NoWarn>
+		<!-- 0436;1073;8509 = original suppressions from template
+		     8600-8625,8765,8767 = nullable reference warnings from ported VTClassic library (third-party code)
+		     0168;0414;CA1416    = unused variable / Windows-only API warnings in VTClassic -->
+		<NoWarn>0436;1073;8509;8600;8601;8602;8603;8604;8610;8618;8625;8765;8767;0168;0414;CA1416</NoWarn>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
 		<OutputPath>C:\ACE\Mods\$(AssemblyName)</OutputPath>
@@ -56,7 +59,7 @@
 		<None Remove=".template.config\**" />
 	</ItemGroup>
 
-	<PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
+<PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
 		<DefineConstants>$(DefineConstants);VTC_PLUGIN</DefineConstants>
 	</PropertyGroup>
 
