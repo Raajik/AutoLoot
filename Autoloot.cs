@@ -1,4 +1,3 @@
-using AutoLoot.Lib.VTClassic;
 using System.Collections.Concurrent;
 
 namespace AutoLoot;
@@ -9,22 +8,29 @@ namespace AutoLoot;
 /// Contains:
 ///   1. The /autoloot command — lets players view and toggle server-hosted .utl loot
 ///      profiles on and off, enable/disable all at once, and toggle loot notifications.
-///   2. A Harmony patch on Creature.GenerateTreasure — fires after any creature dies
-///      and auto-loots items from its corpse according to each player's active profiles.
+///   2. C#-powered special filters: VendorTrash (ratio-based) and Unknown Scrolls.
+///   3. A Harmony patch on Creature.GenerateTreasure — fires after any creature dies
+///      and auto-loots items from its corpse according to each player's active settings.
+///   4. Persistence — each player's settings are saved to a JSON file and restored
+///      automatically on their next session.
 ///
 /// How it works end-to-end:
-///   1. A player types /autoloot to see available profiles with [ON]/[OFF] status.
-///   2. They type /autoloot <#> to toggle a profile. Multiple profiles can be active
-///      at the same time; toggling again turns one off.
+///   1. A player types /autoloot to see available profiles and filters with [ON]/[OFF] status.
+///   2. They toggle profiles, VendorTrash, or scrolls on/off. Settings are saved immediately.
 ///   3. The server's DefaultProfile (PyrealsTradeNotes.utl by default) is automatically
-///      enabled the first time a player uses /autoloot each session.
-///   4. When any creature is killed, GenerateTreasure fires. Our patch checks each item
-///      in the corpse against the player's active profiles and moves matches to their inventory.
-///   5. If the player has loot notifications enabled, a summary message is sent to chat.
+///      enabled the first time a new character uses /autoloot with no saved data.
+///   4. When any creature is killed, GenerateTreasure fires. Saved settings are lazy-loaded
+///      if this is the player's first kill of the session, so looting works even if the
+///      player has never typed /autoloot in the current session.
+///   5. Matched items are moved from the corpse to the player's inventory.
+///   6. If loot notifications are enabled (the default), a chat summary is sent.
+///   7. Rare items trigger a server-wide broadcast.
 /// </summary>
 [HarmonyPatch]
 public class AutoLoot
 {
+    // ── Per-player state ─────────────────────────────────────────────────────
+
     /// <summary>
     /// Tracks which LootCore profiles are currently active for each player.
     ///
@@ -40,7 +46,7 @@ public class AutoLoot
     /// <summary>
     /// Tracks whether each player wants loot notifications in chat.
     ///
-    /// true  = show a summary message when items are auto-looted (default for new players)
+    /// true  = show a summary message when items are auto-looted (default)
     /// false = loot silently with no chat output
     ///
     /// Toggled with: /autoloot details
@@ -48,42 +54,216 @@ public class AutoLoot
     static readonly ConcurrentDictionary<Player, bool> lootNotifications = new();
 
     /// <summary>
-    /// Tracks whether VendorTrash tier 1 (25:1 ratio) is active for each player.
+    /// Tracks whether the VendorTrash ratio filter is on for each player.
     ///
-    /// Loots any item whose sell value is at least 25× its burden weight.
-    /// A broader net — catches most decent vendor fodder.
+    /// When enabled, any item whose sell value is at least (VendorTrashRatio × burden)
+    /// is automatically looted — a "value per pound" check.
     ///
-    /// Example: a gem worth 500 pyreals, burden 5 → ratio 100 ≥ 25 → looted
-    ///
-    /// Toggled with: /autoloot vt1
+    /// Toggled with: /autoloot vt
     /// </summary>
-    static readonly ConcurrentDictionary<Player, bool> vendorTrash1 = new();
+    static readonly ConcurrentDictionary<Player, bool> vendorTrashEnabled = new();
 
     /// <summary>
-    /// Tracks whether VendorTrash tier 2 (50:1 ratio) is active for each player.
+    /// The minimum value:burden ratio each player has set for VendorTrash.
     ///
-    /// Loots any item whose sell value is at least 50× its burden weight.
-    /// A tighter filter — only the most value-dense items make the cut.
-    ///
-    /// Example: a gem worth 500 pyreals, burden 5 → ratio 100 ≥ 50 → looted
-    ///          a ring worth 1,000 pyreals, burden 25 → ratio 40 &lt; 50 → skipped
-    ///
-    /// Toggled with: /autoloot vt2
+    /// Default: 50  — item must be worth at least 50 pyreals per unit of burden.
+    /// Changed with: /autoloot vt [number]  (e.g. /autoloot vt 30)
     /// </summary>
-    static readonly ConcurrentDictionary<Player, bool> vendorTrash2 = new();
+    static readonly ConcurrentDictionary<Player, int> vendorTrashRatio = new();
 
     /// <summary>
-    /// In-game command: /autoloot [on | off | details | index | name]
+    /// Tracks whether the Unknown Scrolls filter is on for each player.
     ///
-    /// No arguments:   shows all commands + full profile list with [ON]/[OFF] status.
-    /// on:             enables every available profile at once.
-    /// off:            disables all currently active profiles.
-    /// details:        toggles loot notifications in chat on or off.
-    /// A number:       toggles the profile at that index on or off.
-    /// A name/partial: toggles the first profile whose filename contains that text.
+    /// When enabled, any scroll dropped by a creature that the player has not yet
+    /// learned is automatically looted. Already-known spells are skipped.
     ///
-    /// The first time a player uses this command each session, the server's DefaultProfile
-    /// (set in Settings.json) is automatically enabled for them.
+    /// Toggled with: /autoloot scrolls
+    /// </summary>
+    static readonly ConcurrentDictionary<Player, bool> unknownScrolls = new();
+
+    /// <summary>
+    /// Tracks whether the player wants a server-wide broadcast when they loot a rare item.
+    ///
+    /// Defaults to false — rares are still looted normally, just without the announcement.
+    /// Players who want to share the moment can opt in with: /autoloot rares
+    /// </summary>
+    static readonly ConcurrentDictionary<Player, bool> broadcastRares = new();
+
+    /// <summary>
+    /// Tracks which characters have already had their saved preferences loaded
+    /// this server session, keyed by character GUID.
+    ///
+    /// This prevents loading the JSON file more than once per session per character.
+    /// We use the character's GUID (a stable uint) rather than the Player object
+    /// so the check survives across reconnects within the same server session.
+    /// </summary>
+    static readonly ConcurrentDictionary<uint, bool> loadedPlayers = new();
+
+    /// <summary>
+    /// Cached JSON options for writing player prefs files.
+    /// Creating a new JsonSerializerOptions on every save is wasteful — reuse one instance.
+    /// </summary>
+    static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+
+    // ── Inventory helpers ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Returns true if the player already owns at least one item with the given WCID,
+    /// searching both the top-level pack AND one level inside any containers (backpacks).
+    ///
+    /// Why two levels? In Asheron's Call, inventory is at most two levels deep:
+    ///   1. Items worn/held directly on the player (player.Inventory)
+    ///   2. Items inside a worn backpack (container.Inventory)
+    /// A pack inside a pack is possible in the client UI but the inner pack's contents
+    /// are not accessible as a second equipped container — so two levels covers all
+    /// items the player can actually access, closing the loophole where stashing a
+    /// quest piece in a bag would let AutoLoot farm unlimited duplicates.
+    /// </summary>
+    static bool PlayerOwnsWcid(Player player, uint wcid)
+    {
+        foreach (var item in player.Inventory.Values)
+        {
+            if (item.WeenieClassId == wcid)
+                return true;
+
+            // If this item is a container (backpack), check one level inside it
+            if (item is Container container)
+                foreach (var sub in container.Inventory.Values)
+                    if (sub.WeenieClassId == wcid)
+                        return true;
+        }
+        return false;
+    }
+
+    // ── Persistence helpers ──────────────────────────────────────────────────
+
+    /// <summary>
+    /// Returns the path to the JSON prefs file for a given player.
+    /// Also creates the PlayerData directory if it doesn't exist yet.
+    ///
+    /// Example path: C:\ACE\Mods\AutoLoot\LootProfiles\PlayerData\12345678.json
+    /// </summary>
+    static string GetPlayerDataPath(Player player)
+    {
+        var dir = Path.Combine(PatchClass.Settings.LootProfilePath, "PlayerData");
+        Directory.CreateDirectory(dir);
+        return Path.Combine(dir, $"{player.Guid.Full}.json");
+    }
+
+    /// <summary>
+    /// Loads a player's saved preferences the first time they are encountered this session.
+    ///
+    /// Silently does nothing if:
+    ///   - The player has already been loaded this session (idempotent)
+    ///   - No saved file exists yet (new player — defaults apply)
+    ///
+    /// Call this at the start of any operation that reads or modifies player state,
+    /// so prefs are always available regardless of whether the player typed /autoloot.
+    /// </summary>
+    static void EnsureLoaded(Player player)
+    {
+        // TryAdd returns false if the key already exists — means we've already loaded
+        if (!loadedPlayers.TryAdd(player.Guid.Full, true))
+            return;
+
+        var path = GetPlayerDataPath(player);
+        if (!File.Exists(path))
+            return;
+
+        try
+        {
+            var json = File.ReadAllText(path);
+            var prefs = JsonSerializer.Deserialize<PlayerPrefs>(json);
+            if (prefs == null)
+                return;
+
+            // Restore .utl profiles — resolve filenames back to full paths
+            var allProfiles = Directory.GetFiles(
+                PatchClass.Settings.LootProfilePath, "*.utl", SearchOption.TopDirectoryOnly);
+
+            var playerProfileMap = lootProfiles.GetOrAdd(player, _ => new ConcurrentDictionary<string, LootCore>());
+
+            foreach (var name in prefs.ActiveProfileNames)
+            {
+                var fullPath = allProfiles.FirstOrDefault(p =>
+                    Path.GetFileName(p).Equals(name, StringComparison.OrdinalIgnoreCase));
+
+                if (fullPath == null || playerProfileMap.ContainsKey(fullPath))
+                    continue;
+
+                var core = new LootCore();
+                core.Startup();
+                core.LoadProfile(fullPath, false);
+                playerProfileMap[fullPath] = core;
+            }
+
+            // Restore scalar settings
+            lootNotifications[player] = prefs.LootNotifications;
+            vendorTrashEnabled[player] = prefs.VendorTrashEnabled;
+            vendorTrashRatio[player] = prefs.VendorTrashRatio;
+            unknownScrolls[player] = prefs.UnknownScrollsEnabled;
+            broadcastRares[player] = prefs.BroadcastRares;
+        }
+        catch (Exception ex)
+        {
+            ModManager.Log($"AutoLoot: failed to load prefs for {player.Name}: {ex.Message}", ModManager.LogLevel.Warn);
+        }
+    }
+
+    /// <summary>
+    /// Writes the player's current preferences to their JSON file immediately.
+    ///
+    /// Call this after any toggle so that settings survive server restarts.
+    /// The file is small (a few hundred bytes) so synchronous I/O is fine here.
+    /// </summary>
+    static void SavePrefs(Player player)
+    {
+        try
+        {
+            lootProfiles.TryGetValue(player, out var profileMap);
+
+            var prefs = new PlayerPrefs
+            {
+                // Store just the filename, not the full path, so saves survive path changes
+                ActiveProfileNames = profileMap?.Keys
+                    .Select(Path.GetFileName)
+                    .Where(n => n != null)
+                    .Cast<string>()
+                    .ToList() ?? [],
+
+                LootNotifications     = lootNotifications.GetOrAdd(player, true),
+                VendorTrashEnabled    = vendorTrashEnabled.GetOrAdd(player, false),
+                VendorTrashRatio      = vendorTrashRatio.GetOrAdd(player, 50),
+                UnknownScrollsEnabled = unknownScrolls.GetOrAdd(player, false),
+                BroadcastRares        = broadcastRares.GetOrAdd(player, false),
+            };
+
+            var path = GetPlayerDataPath(player);
+            File.WriteAllText(path, JsonSerializer.Serialize(prefs, JsonOptions));
+        }
+        catch (Exception ex)
+        {
+            ModManager.Log($"AutoLoot: failed to save prefs for {player.Name}: {ex.Message}", ModManager.LogLevel.Warn);
+        }
+    }
+
+    // ── Command handler ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// In-game command: /autoloot [on | off | details | vt [ratio] | scrolls | index | name]
+    ///
+    /// No arguments:      shows all commands + full profile list with [ON]/[OFF] status.
+    /// on:                enables every profile, VendorTrash, and Unknown Scrolls at once.
+    /// off:               disables everything.
+    /// details:           toggles loot notifications in chat on or off.
+    /// vt:                toggles VendorTrash on/off (e.g. /autoloot vt)
+    /// vt [number]:       sets VendorTrash ratio and enables it (e.g. /autoloot vt 30)
+    /// scrolls:           toggles Unknown Scrolls filter on/off.
+    /// A number:          toggles the profile at that index on or off.
+    /// A name/partial:    toggles the first profile whose filename contains that text.
+    ///
+    /// The first time a brand-new character uses /autoloot (no saved data), the server's
+    /// DefaultProfile (set in Settings.json) is automatically enabled for them.
     /// </summary>
     [CommandHandler("autoloot", AccessLevel.Player, CommandHandlerFlag.RequiresWorld, -1)]
 #if REALM
@@ -96,22 +276,25 @@ public static void HandleLoadProfile(ISession session, params string[] parameter
 
         try
         {
-            // Ensure the LootProfiles directory exists (the .utl files are deployed by the build,
-            // but the folder might be missing if someone deleted it manually)
+            // Ensure the LootProfiles directory exists
             Directory.CreateDirectory(PatchClass.Settings.LootProfilePath);
 
-            // All profiles are server-hosted — .utl files in LootProfilePath.
-            // Every player on the server sees the same list.
+            // Load saved prefs (no-op after the first call per session)
+            EnsureLoaded(player);
+
+            // All profiles are server-hosted — .utl files in LootProfilePath
             var profiles = Directory.GetFiles(
                 PatchClass.Settings.LootProfilePath, "*.utl", SearchOption.TopDirectoryOnly);
 
-            // Detect first-time players this session and auto-enable the default profile
-            bool isNewPlayer = !lootProfiles.ContainsKey(player);
             var playerProfiles = lootProfiles.GetOrAdd(player, _ => new ConcurrentDictionary<string, LootCore>());
 
-            if (isNewPlayer && !string.IsNullOrEmpty(PatchClass.Settings.DefaultProfile))
+            // First-ever use for this character (no saved file, no prior session activity):
+            // auto-enable the server's DefaultProfile so there's something useful running
+            bool isNewCharacter = !loadedPlayers.ContainsKey(player.Guid.Full) && !File.Exists(GetPlayerDataPath(player));
+            // Note: loadedPlayers.TryAdd already ran in EnsureLoaded above, so check the file instead
+            if (playerProfiles.IsEmpty && !File.Exists(Path.Combine(PatchClass.Settings.LootProfilePath, "PlayerData", $"{player.Guid.Full}.json"))
+                && !string.IsNullOrEmpty(PatchClass.Settings.DefaultProfile))
             {
-                // Find and load the default profile (case-insensitive filename match)
                 var defaultPath = profiles.FirstOrDefault(p =>
                     Path.GetFileName(p).Equals(PatchClass.Settings.DefaultProfile, StringComparison.OrdinalIgnoreCase));
 
@@ -121,6 +304,7 @@ public static void HandleLoadProfile(ISession session, params string[] parameter
                     defaultCore.Startup();
                     defaultCore.LoadProfile(defaultPath, false);
                     playerProfiles[defaultPath] = defaultCore;
+                    SavePrefs(player);
                 }
             }
 
@@ -129,17 +313,21 @@ public static void HandleLoadProfile(ISession session, params string[] parameter
             if (parameters.Length == 0)
             {
                 bool notificationsOn = lootNotifications.GetOrAdd(player, true);
+                bool vtOn = vendorTrashEnabled.GetOrAdd(player, false);
+                int vtRatio = vendorTrashRatio.GetOrAdd(player, 50);
+                bool scrollsOn = unknownScrolls.GetOrAdd(player, false);
+                bool raresOn = broadcastRares.GetOrAdd(player, false);
 
                 var sb = new StringBuilder("\nAutoLoot Commands:");
-                sb.Append("\n  /autoloot <#>        — toggle profile on/off by number");
-                sb.Append("\n  /autoloot <name>     — toggle profile on/off by partial name");
-                sb.Append("\n  /autoloot on         — enable all profiles");
-                sb.Append("\n  /autoloot off        — disable all profiles");
+                sb.Append("\n  /autoloot <#>          — toggle profile on/off by number");
+                sb.Append("\n  /autoloot <name>       — toggle profile on/off by partial name");
+                sb.Append("\n  /autoloot on           — enable everything");
+                sb.Append("\n  /autoloot off          — disable everything");
                 sb.Append($"\n  /autoloot details      — toggle loot notifications [{(notificationsOn ? "ON" : "OFF")}]");
-                sb.Append("\n  /autoloot vt1          — toggle VendorTrash 25:1 (broader)");
-                sb.Append("\n  /autoloot vt2          — toggle VendorTrash 50:1 (stricter)");
+                sb.Append($"\n  /autoloot vt [ratio]   — toggle VendorTrash (current ratio: {vtRatio}:1)");
+                sb.Append("\n  /autoloot scrolls      — toggle Unknown Scrolls filter");
+                sb.Append("\n  /autoloot rares        — toggle server-wide rare broadcast");
 
-                // Developer-only commands (also visible to Admins since Admin > Developer)
                 if (session.AccessLevel >= AccessLevel.Developer)
                 {
                     sb.Append("\n\n  [Developer]");
@@ -155,7 +343,6 @@ public static void HandleLoadProfile(ISession session, params string[] parameter
                     sb.Append("\n  /clean — remove all items from your inventory (for testing cleanup)");
                 }
 
-                // List every profile with its current ON/OFF status
                 sb.Append("\n\nProfiles:");
                 if (profiles.Length == 0)
                 {
@@ -171,11 +358,9 @@ public static void HandleLoadProfile(ISession session, params string[] parameter
                     }
                 }
 
-                // VendorTrash tiers are C#-powered filters — show them separately from .utl profiles
-                bool vt1On = vendorTrash1.GetOrAdd(player, false);
-                bool vt2On = vendorTrash2.GetOrAdd(player, false);
-                sb.Append($"\n  V1) {(vt1On ? "[ON] " : "[OFF]")} VendorTrash 25:1  —  loot items worth ≥ 25× their burden");
-                sb.Append($"\n  V2) {(vt2On ? "[ON] " : "[OFF]")} VendorTrash 50:1  —  loot items worth ≥ 50× their burden");
+                sb.Append($"\n  V) {(vtOn ? "[ON] " : "[OFF]")} VendorTrash {vtRatio}:1  —  loot items worth ≥ {vtRatio}× their burden");
+                sb.Append($"\n  S) {(scrollsOn ? "[ON] " : "[OFF]")} Unknown Scrolls  —  loot scrolls you haven't learned yet");
+                sb.Append($"\n  R) {(raresOn ? "[ON] " : "[OFF]")} Rare Broadcast  —  announce rare loots server-wide");
 
                 player.SendMessage(sb.ToString());
                 return;
@@ -183,7 +368,7 @@ public static void HandleLoadProfile(ISession session, params string[] parameter
 
             var arg = parameters[0];
 
-            // ── /autoloot on — enable every profile ─────────────────────────────────
+            // ── /autoloot on — enable everything ────────────────────────────────────
 
             if (arg.Equals("on", StringComparison.OrdinalIgnoreCase))
             {
@@ -199,15 +384,16 @@ public static void HandleLoadProfile(ISession session, params string[] parameter
                         enabled++;
                     }
                 }
-                if (!vendorTrash1.GetOrAdd(player, false)) { vendorTrash1[player] = true; enabled++; }
-                if (!vendorTrash2.GetOrAdd(player, false)) { vendorTrash2[player] = true; enabled++; }
+                if (!vendorTrashEnabled.GetOrAdd(player, false)) { vendorTrashEnabled[player] = true; enabled++; }
+                if (!unknownScrolls.GetOrAdd(player, false)) { unknownScrolls[player] = true; enabled++; }
+                SavePrefs(player);
                 player.SendMessage(enabled > 0
                     ? $"Enabled {enabled} profile(s). Type /autoloot to see the list."
-                    : "All profiles are already enabled.");
+                    : "Everything is already enabled.");
                 return;
             }
 
-            // ── /autoloot off — disable every profile ───────────────────────────────
+            // ── /autoloot off — disable everything ──────────────────────────────────
 
             if (arg.Equals("off", StringComparison.OrdinalIgnoreCase))
             {
@@ -220,11 +406,12 @@ public static void HandleLoadProfile(ISession session, params string[] parameter
                         disabled++;
                     }
                 }
-                if (vendorTrash1.GetOrAdd(player, false)) { vendorTrash1[player] = false; disabled++; }
-                if (vendorTrash2.GetOrAdd(player, false)) { vendorTrash2[player] = false; disabled++; }
+                if (vendorTrashEnabled.GetOrAdd(player, false)) { vendorTrashEnabled[player] = false; disabled++; }
+                if (unknownScrolls.GetOrAdd(player, false)) { unknownScrolls[player] = false; disabled++; }
+                SavePrefs(player);
                 player.SendMessage(disabled > 0
                     ? $"Disabled {disabled} profile(s)."
-                    : "No profiles were active.");
+                    : "Nothing was active.");
                 return;
             }
 
@@ -234,27 +421,59 @@ public static void HandleLoadProfile(ISession session, params string[] parameter
             {
                 bool current = lootNotifications.GetOrAdd(player, true);
                 lootNotifications[player] = !current;
+                SavePrefs(player);
                 player.SendMessage($"Loot notifications: {(!current ? "ON" : "OFF")}");
                 return;
             }
 
-            // ── /autoloot vt1 — toggle VendorTrash 25:1 ─────────────────────────────
+            // ── /autoloot vt [ratio] — toggle VendorTrash, optionally set ratio ──────
+            //
+            // /autoloot vt         → toggle on/off (keeps current ratio)
+            // /autoloot vt 30      → set ratio to 30 and enable
+            // /autoloot vt 0       → disable (ratio 0 = off)
 
-            if (arg.Equals("vt1", StringComparison.OrdinalIgnoreCase))
+            if (arg.Equals("vt", StringComparison.OrdinalIgnoreCase))
             {
-                bool current = vendorTrash1.GetOrAdd(player, false);
-                vendorTrash1[player] = !current;
-                player.SendMessage($"VendorTrash 25:1: {(!current ? "ON" : "OFF")} (loot items worth ≥ 25× their burden)");
+                // Optional second parameter: the new ratio
+                if (parameters.Length > 1 && int.TryParse(parameters[1], out int newRatio) && newRatio > 0)
+                {
+                    vendorTrashRatio[player] = newRatio;
+                    vendorTrashEnabled[player] = true;
+                    SavePrefs(player);
+                    player.SendMessage($"VendorTrash ON at {newRatio}:1 (loot items worth ≥ {newRatio}× their burden)");
+                }
+                else
+                {
+                    bool current = vendorTrashEnabled.GetOrAdd(player, false);
+                    vendorTrashEnabled[player] = !current;
+                    int ratio = vendorTrashRatio.GetOrAdd(player, 50);
+                    SavePrefs(player);
+                    player.SendMessage(!current
+                        ? $"VendorTrash ON at {ratio}:1 (loot items worth ≥ {ratio}× their burden)"
+                        : "VendorTrash OFF");
+                }
                 return;
             }
 
-            // ── /autoloot vt2 — toggle VendorTrash 50:1 ─────────────────────────────
+            // ── /autoloot scrolls — toggle Unknown Scrolls filter ────────────────────
 
-            if (arg.Equals("vt2", StringComparison.OrdinalIgnoreCase))
+            if (arg.Equals("scrolls", StringComparison.OrdinalIgnoreCase))
             {
-                bool current = vendorTrash2.GetOrAdd(player, false);
-                vendorTrash2[player] = !current;
-                player.SendMessage($"VendorTrash 50:1: {(!current ? "ON" : "OFF")} (loot items worth ≥ 50× their burden)");
+                bool current = unknownScrolls.GetOrAdd(player, false);
+                unknownScrolls[player] = !current;
+                SavePrefs(player);
+                player.SendMessage($"Unknown Scrolls: {(!current ? "ON" : "OFF")} (loot scrolls you haven't learned)");
+                return;
+            }
+
+            // ── /autoloot rares — toggle server-wide rare broadcast ──────────────────
+
+            if (arg.Equals("rares", StringComparison.OrdinalIgnoreCase))
+            {
+                bool current = broadcastRares.GetOrAdd(player, false);
+                broadcastRares[player] = !current;
+                SavePrefs(player);
+                player.SendMessage($"Rare Broadcast: {(!current ? "ON" : "OFF")} (server-wide message when you loot a rare)");
                 return;
             }
 
@@ -279,10 +498,10 @@ public static void HandleLoadProfile(ISession session, params string[] parameter
 
             var displayName = Path.GetFileNameWithoutExtension(selected);
 
-            // If already active → turn off. If inactive → turn on.
             if (playerProfiles.TryRemove(selected, out var existingCore))
             {
                 existingCore.Shutdown();
+                SavePrefs(player);
                 player.SendMessage($"[OFF] {displayName}");
             }
             else
@@ -291,6 +510,7 @@ public static void HandleLoadProfile(ISession session, params string[] parameter
                 newCore.Startup();
                 newCore.LoadProfile(selected, false);
                 playerProfiles[selected] = newCore;
+                SavePrefs(player);
                 player.SendMessage($"[ON]  {displayName}");
             }
         }
@@ -308,12 +528,15 @@ public static void HandleLoadProfile(ISession session, params string[] parameter
     /// Harmony Postfix patch on Creature.GenerateTreasure.
     ///
     /// Runs AFTER the original method, so the corpse is already filled with loot.
-    /// For each item in the corpse, we check the player's active profiles in order.
-    /// The first profile that matches an item claims it — the item moves to the player's
-    /// inventory and we stop checking other profiles for that item.
+    /// Processing order for each corpse:
+    ///   1. .utl profile pass — first matching profile claims the item
+    ///   2. VendorTrash pass  — unclaimed items that meet the value:burden ratio
+    ///   3. Unknown Scrolls   — unclaimed scrolls the player hasn't learned yet
     ///
-    /// If the player has notifications enabled (the default), a summary is sent to chat
-    /// listing everything that was looted, grouped by item name with quantities.
+    /// After all passes:
+    ///   - Rare items trigger a server-wide broadcast
+    ///   - If notifications are on, a loot summary is sent to the player
+    ///   - Learnable scrolls get a separate [!] line in the summary
     /// </summary>
     [HarmonyPostfix]
     [HarmonyPatch(typeof(Creature), nameof(Creature.GenerateTreasure), new Type[] { typeof(DamageHistoryInfo), typeof(Corpse) })]
@@ -323,37 +546,62 @@ public static void HandleLoadProfile(ISession session, params string[] parameter
         if (killer.TryGetPetOwnerOrAttacker() is not Player player)
             return;
 
-        // Check what the player has active — profiles, VendorTrash, or both.
-        // We need at least one active to do anything.
-        lootProfiles.TryGetValue(player, out var playerProfiles);
-        bool hasProfiles = playerProfiles != null && !playerProfiles.IsEmpty;
-        bool hasVT1 = vendorTrash1.GetOrAdd(player, false);
-        bool hasVT2 = vendorTrash2.GetOrAdd(player, false);
+        // Lazy-load saved preferences on first kill of the session
+        EnsureLoaded(player);
 
-        if (!hasProfiles && !hasVT1 && !hasVT2)
+        // Check what the player has active — bail early if nothing is on
+        lootProfiles.TryGetValue(player, out var playerProfiles);
+        bool hasProfiles    = playerProfiles != null && !playerProfiles.IsEmpty;
+        bool hasVT          = vendorTrashEnabled.GetOrAdd(player, false);
+        bool hasScrolls     = unknownScrolls.GetOrAdd(player, false);
+
+        if (!hasProfiles && !hasVT && !hasScrolls)
             return;
 
         try
         {
-            // Snapshot both collections so they can't change while we iterate
+            // Snapshot the corpse inventory — items will be removed as we loot them
             var items = corpse.Inventory.Values.ToList();
             var activeProfiles = hasProfiles ? playerProfiles!.Values.ToList() : new List<LootCore>();
 
-            // lootedItems tracks name → total quantity for the chat notification.
-            // lootedSet tracks which specific WorldObject instances have already been claimed
-            // so the VendorTrash pass below doesn't double-pick the same item.
-            var lootedItems = new Dictionary<string, int>();
-            var lootedSet = new HashSet<WorldObject>();
+            // lootedItems:   name → total quantity, for the chat summary
+            // lootedSet:     the WorldObject instances we actually moved, so later passes don't double-claim
+            // lootedScrolls: names of learnable scrolls, for the special [!] notification line
+            // lootedVTNames: names of items looted by VendorTrash, so they can be prefixed with [$]
+            var lootedItems   = new Dictionary<string, int>();
+            var lootedSet     = new HashSet<WorldObject>();
+            var lootedScrolls = new List<string>();
+            var lootedVTNames = new HashSet<string>();
+
+            // ── Pass 1: .utl profiles ────────────────────────────────────────────────
+            //
+            // Each item is checked against every active profile in order.
+            // The first profile that matches claims the item; we stop checking after that.
+
+            // Pre-build the no-duplicate filter from Settings — avoids re-reading Settings per item.
+            // An item is blocked if its name matches a configured fragment AND the player already
+            // owns one of the same WCID. This prevents AutoLoot from stockpiling quest turn-in items
+            // (Pincers, Tusks, Matron parts, etc.) ahead of quest timers — without this guard, a
+            // player could farm unlimited pieces and bypass the intended cooldown indefinitely.
+            var noDupPatterns = PatchClass.Settings?.NoDuplicateNames ?? [];
 
             foreach (var item in items)
             {
+                // Skip quest turn-in items the player already has — prevents timer bypass farming
+                if (noDupPatterns.Count > 0 &&
+                    noDupPatterns.Any(p => item.Name?.Contains(p, StringComparison.OrdinalIgnoreCase) == true) &&
+                    PlayerOwnsWcid(player, item.WeenieClassId))
+                {
+                    continue;
+                }
+
                 foreach (var profile in activeProfiles)
                 {
                     var lootAction = profile.GetLootDecision(item, player);
                     if (lootAction.IsNoLoot)
                         continue;
 
-                    // First profile that claims this item wins — remove from corpse, add to inventory
+                    // Remove from corpse first so no ghost item is left behind
                     if (!corpse.TryRemoveFromInventory(item.Guid, out var removed))
                         break;
 
@@ -361,28 +609,28 @@ public static void HandleLoadProfile(ISession session, params string[] parameter
                     lootedItems.TryGetValue(removed.Name, out var existing);
                     lootedItems[removed.Name] = existing + qty;
 
-                    lootedSet.Add(item);
+                    lootedSet.Add(removed);
                     player.TryCreateInInventoryWithNetworking(removed);
                     break;
                 }
             }
 
-            // VendorTrash pass: loot unclaimed items that meet the player's active ratio threshold.
-            // vt1 uses a 25:1 ratio (broader), vt2 uses 50:1 (stricter).
-            // If both are on, vt1's lower threshold already covers everything vt2 would catch,
-            // so we just use whichever active tier has the lowest ratio.
-            if (hasVT1 || hasVT2)
+            // ── Pass 2: VendorTrash ──────────────────────────────────────────────────
+            //
+            // Loot unclaimed items whose sell value is at least (ratio × burden).
+            // "value per pound" — high ratio = efficient to carry to a vendor.
+
+            if (hasVT)
             {
-                int threshold = hasVT1 ? 25 : 50;
+                int threshold = vendorTrashRatio.GetOrAdd(player, 50);
 
                 foreach (var item in items)
                 {
-                    // Skip items already moved to inventory by a profile above
                     if (lootedSet.Contains(item))
                         continue;
 
-                    var value = item.Value ?? 0;
-                    var burden = item.EncumbranceVal ?? 1; // treat 0-burden items as 1 to avoid division by zero
+                    var value  = item.Value ?? 0;
+                    var burden = item.EncumbranceVal ?? 1;
                     if (burden <= 0) burden = 1;
 
                     if (value >= threshold * burden)
@@ -394,35 +642,103 @@ public static void HandleLoadProfile(ISession session, params string[] parameter
                         lootedItems.TryGetValue(removed.Name, out var existing);
                         lootedItems[removed.Name] = existing + qty;
 
-                        lootedSet.Add(item);
+                        lootedSet.Add(removed);
+                        lootedVTNames.Add(removed.Name); // mark for [$] prefix in notification
                         player.TryCreateInInventoryWithNetworking(removed);
                     }
+                }
+            }
+
+            // ── Pass 3: Unknown Scrolls ──────────────────────────────────────────────
+            //
+            // Loot any scroll that the player hasn't learned yet.
+            // Checks WeenieType and SpellDID, then player.SpellIsKnown.
+
+            if (hasScrolls)
+            {
+                foreach (var item in items)
+                {
+                    if (lootedSet.Contains(item))
+                        continue;
+
+                    // Must be a scroll with a spell attached
+                    if (item.WeenieType != WeenieType.Scroll)
+                        continue;
+
+                    var spellId = item.GetProperty(PropertyDataId.Spell);
+                    if (spellId == null || spellId == 0)
+                        continue;
+
+                    // Skip spells the player already knows
+                    if (player.SpellIsKnown((uint)spellId))
+                        continue;
+
+                    if (!corpse.TryRemoveFromInventory(item.Guid, out var removed))
+                        continue;
+
+                    var qty = removed.StackSize ?? 1;
+                    lootedItems.TryGetValue(removed.Name, out var existing);
+                    lootedItems[removed.Name] = existing + qty;
+
+                    lootedSet.Add(removed);
+                    lootedScrolls.Add(removed.Name); // mark for special notification
+                    player.TryCreateInInventoryWithNetworking(removed);
+                }
+            }
+
+            // ── Rare broadcast ───────────────────────────────────────────────────────
+            //
+            // If any looted item is a rare (has a non-zero RareId property) AND the
+            // player has opted in to rare broadcasts, announce it server-wide.
+
+            if (broadcastRares.GetOrAdd(player, false))
+            {
+                foreach (var looted in lootedSet)
+                {
+                    var rareId = looted.GetProperty(PropertyInt.RareId);
+                    if (rareId == null || rareId == 0)
+                        continue;
+
+                    var rareMsg = $"{player.Name} has looted the rare item, {looted.Name}!";
+                    foreach (var p in PlayerManager.GetAllOnline())
+                        p.SendMessage(rareMsg, ChatMessageType.Broadcast);
                 }
             }
 
             if (lootedItems.Count == 0)
                 return;
 
-            // Only send a chat message if the player has notifications enabled
+            // ── Chat notification ────────────────────────────────────────────────────
+
             bool notify = lootNotifications.GetOrAdd(player, true);
             if (!notify)
                 return;
 
-            // Build a natural-language list: "a Tinkerer's Crystal, 2 Copper Peas, and 1,293 Pyreals"
-            var parts = lootedItems
-                .Select(kvp => kvp.Value == 1
-                    ? $"a {kvp.Key}"
-                    : $"{kvp.Value:N0} {kvp.Key}")
+            // Build the regular loot summary (excludes scrolls — they get their own line).
+            // VendorTrash items are suffixed with [$] so the player knows why they were picked up.
+            var regularItems = lootedItems
+                .Where(kvp => !lootedScrolls.Contains(kvp.Key))
+                .Select(kvp =>
+                {
+                    var suffix = lootedVTNames.Contains(kvp.Key) ? " [$]" : "";
+                    return kvp.Value == 1 ? $"a {kvp.Key}{suffix}" : $"{kvp.Value:N0} {kvp.Key}{suffix}";
+                })
                 .ToList();
 
-            string itemList = parts.Count switch
+            if (regularItems.Count > 0)
             {
-                1 => parts[0],
-                2 => $"{parts[0]} and {parts[1]}",
-                _ => string.Join(", ", parts.Take(parts.Count - 1)) + $", and {parts[^1]}"
-            };
+                string itemList = regularItems.Count switch
+                {
+                    1 => regularItems[0],
+                    2 => $"{regularItems[0]} and {regularItems[1]}",
+                    _ => string.Join(", ", regularItems.Take(regularItems.Count - 1)) + $", and {regularItems[^1]}"
+                };
+                player.SendMessage($"[AutoLoot] You've looted {itemList}!");
+            }
 
-            player.SendMessage($"[AutoLoot] You've looted {itemList}!");
+            // Learnable scrolls get a distinct [!] line so they stand out
+            foreach (var scrollName in lootedScrolls.Distinct())
+                player.SendMessage($"[AutoLoot] [!] You can learn: {scrollName}");
         }
         catch (Exception ex)
         {
