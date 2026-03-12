@@ -156,6 +156,12 @@
 		<None Update="Meta.json">
 			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
 		</None>
+		<!-- Ship .utl loot profiles alongside the mod DLL.
+		     PreserveNewest copies the file only if the source is newer than the destination,
+		     so server admins can customize profiles without them being overwritten on rebuild. -->
+		<None Include="LootProfiles\*.utl">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</None>
 	</ItemGroup>
 
 	<!--More cleanup in Release mode?-->

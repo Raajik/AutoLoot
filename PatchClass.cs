@@ -10,15 +10,36 @@ namespace AutoLoot;
 /// The [HarmonyPatch] attribute on the class tells Harmony to scan this class for
 /// any methods decorated with [HarmonyPrefix] / [HarmonyPostfix] etc. and automatically
 /// apply them when the mod loads.
-///
-/// To add a patch: write a public static method in this class and decorate it with
-/// [HarmonyPostfix] or [HarmonyPrefix] plus [HarmonyPatch(typeof(TargetClass), "MethodName")].
 /// </summary>
 [HarmonyPatch]
-public class PatchClass(BasicMod mod, string settingsName = "Settings.json") : BasicPatch<Settings>(mod, settingsName)
+public class PatchClass : BasicPatch<Settings>
 {
-    // Patches and command handlers live here or in AutoLoot.cs.
-    // See AutoLoot.cs for the main /loot command and the GenerateTreasure patch.
+    // Patches and command handlers live in AutoLoot.cs.
+    // See AutoLoot.cs for the main /autoloot command and the GenerateTreasure patch.
+
+    /// <summary>
+    /// Constructor. Called immediately when ACE loads the mod.
+    ///
+    /// We initialize Settings here rather than relying on OnWorldOpen, because
+    /// OnWorldOpen doesn't reliably fire before players issue their first command.
+    /// The null-coalescing fallback (new Settings()) uses all the defaults defined
+    /// in Settings.cs, so the mod still works even if Settings.json doesn't exist yet.
+    /// </summary>
+    public PatchClass(BasicMod mod, string settingsName = "Settings.json") : base(mod, settingsName)
+    {
+        try { Settings ??= SettingsContainer.Settings; }
+        catch { Settings ??= new Settings(); }
+    }
+
+    /// <summary>
+    /// Called each time the world becomes active (including after hot-reloads).
+    /// Re-assigns Settings so any edits to Settings.json are picked up without a restart.
+    /// </summary>
+    public override async Task OnWorldOpen()
+    {
+        try { Settings = SettingsContainer.Settings; }
+        catch { Settings ??= new Settings(); }
+    }
 }
 
 /// <summary>

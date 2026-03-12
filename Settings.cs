@@ -23,22 +23,21 @@ public class Settings
     /// So the default value resolves to:
     ///   C:\ACE\Mods\AutoLoot\LootProfiles\
     ///
+    /// Note: ModManager.ModPath points to the Mods root (C:\ACE\Mods), not this mod's
+    /// subfolder, so "AutoLoot" is included explicitly in the path.
+    ///
     /// You can override this in Settings.json to point at any folder on the server machine,
     /// for example a shared network drive or a per-server config directory.
     ///
-    /// The /loot command creates this folder automatically if it doesn't exist yet.
+    /// The /autoloot command creates this folder automatically if it doesn't exist yet.
     /// </summary>
-    public string LootProfilePath { get; set; } = Path.Combine(ModManager.ModPath, "LootProfiles");
+    public string LootProfilePath { get; set; } = Path.Combine(ModManager.ModPath, "AutoLoot", "LootProfiles");
 
     /// <summary>
-    /// When true, the mod will look for a subfolder inside LootProfilePath that matches
-    /// the player's account username, and search that subfolder for .utl files.
+    /// The filename of the profile that is automatically enabled for a player the first
+    /// time they use /autoloot in a session. All other profiles start off.
     ///
-    /// For example, if a player's username is "Alice", the mod would look in:
-    ///   LootProfilePath\Alice\
-    ///
-    /// This lets you give each player their own private set of loot profiles.
-    /// When false, all players share the same profiles from LootProfilePath directly.
+    /// Set to an empty string to start all players with no profiles active.
     /// </summary>
-    public bool LootProfileUseUsername { get; set; } = true;
+    public string DefaultProfile { get; set; } = "PyrealsTradeNotes.utl";
 }
