@@ -10,7 +10,7 @@ When a player kills a creature, AutoLoot checks the corpse and moves matching it
 
 Each kill is processed in three passes:
 
-1. **Profile pass** — checks every item against the player's active `.utl` loot profiles (VirindiTank-compatible rule files)
+1. **Profile pass** — checks every item against the server's available `.utl` loot profiles (VirindiTank-compatible rule files placed by server admins)
 2. **VendorTrash pass** — picks up any unclaimed item whose sell value is at least N× its burden (configurable ratio)
 3. **Unknown Scrolls pass** — picks up any unclaimed scroll the player hasn't learned yet
 
@@ -21,7 +21,7 @@ After looting, a chat summary tells you what was picked up and why.
 ## Installation
 
 1. Build the project (or download a release) and copy the output folder to `C:\ACE\Mods\AutoLoot\`
-2. Place your `.utl` loot profiles in `C:\ACE\Mods\AutoLoot\LootProfiles\`
+2. Place the server's `.utl` loot profiles in `C:\ACE\Mods\AutoLoot\LootProfiles\`
 3. Restart the server or hot-reload with `/mod f AutoLoot`
 4. Players can type `/autoloot` in-game to get started
 
@@ -46,7 +46,11 @@ All commands start with `/autoloot`.
 
 ---
 
-## Included Loot Profiles
+## Server Loot Profiles
+
+Profiles are `.utl` files placed by the server admin in the `LootProfiles/` folder. Players cannot create or upload their own — they simply toggle the server's profiles on or off. Any VirindiTank-compatible `.utl` file added to `LootProfiles/` will automatically appear in every player's toggle list.
+
+The following profiles are included out of the box:
 
 | Profile | What it loots |
 |---|---|
@@ -56,8 +60,6 @@ All commands start with `/autoloot`.
 | `PincerTuskMatron.utl` | Pincer, Tusk, and Matron quest turn-in pieces |
 | `PyrealMotes.utl` | Pyreal Motes |
 | `Peas.utl` | Peas |
-
-Server admins can add any VirindiTank-compatible `.utl` file to the `LootProfiles/` folder and it will appear in every player's profile list automatically.
 
 ---
 
